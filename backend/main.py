@@ -7,6 +7,10 @@ import os
 from dotenv import load_dotenv
 from google.oauth2 import id_token
 from google.auth.transport import requests
+from calendar_manager import CalendarManager
+from db_helpers import createMongoClient, loadEnvVariables
+from campus_calendar import InMemoryCalendarManager
+from pymongo import MongoClient
 
 # Load environment variables
 load_dotenv()
@@ -25,10 +29,81 @@ class AuthResponse(BaseModel):
     user_name: str
     user_id: str
 
+# Calendar Event Models
+class EventCreate(BaseModel):
+    user_id: str
+    title: str
+    start_time: str  # ISO format datetime string
+    end_time: str    # ISO format datetime string
+    event_type: str
+    location: Optional[str] = None
+    description: Optional[str] = None
+    color: Optional[str] = "#3498db"
+    recurrence: Optional[str] = "none"
+    recurrence_end_date: Optional[str] = None
+    reminders: Optional[List[int]] = [15, 60]
+
+class EventUpdate(BaseModel):
+    title: Optional[str] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    event_type: Optional[str] = None
+    location: Optional[str] = None
+    description: Optional[str] = None
+    color: Optional[str] = None
+    recurrence: Optional[str] = None
+    recurrence_end_date: Optional[str] = None
+    reminders: Optional[List[int]] = None
+
+class EventResponse(BaseModel):
+    id: str
+    user_id: str
+    title: str
+    start_time: str
+    end_time: str
+    event_type: str
+    location: Optional[str] = None
+    description: Optional[str] = None
+    color: str
+    recurrence: str
+    recurrence_end_date: Optional[str] = None
+    reminders: List[int]
+    duration_minutes: Optional[int] = None
+
 app = FastAPI()
 
 # Configuration
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+
+# Initialize MongoDB and CalendarManager
+mongo_client: Optional[MongoClient] = None
+calendar_manager: Optional[CalendarManager] = None
+
+@app.on_event("startup")
+async def startup_event():
+    global mongo_client, calendar_manager
+    try:
+        uri = loadEnvVariables()
+        mongo_client = createMongoClient(uri)
+        calendar_manager = CalendarManager(mongo_client)
+        print("CalendarManager initialized successfully")
+    except Exception as e:
+        print(f"Warning: Failed to initialize MongoDB/CalendarManager: {e}")
+        print("Falling back to in-memory calendar manager (no persistence).")
+        # Use an in-memory fallback so the app remains functional for adding events during local dev
+        try:
+            calendar_manager = InMemoryCalendarManager()
+            print("In-memory CalendarManager initialized successfully")
+        except Exception as e2:
+            print(f"Failed to initialize in-memory calendar manager: {e2}")
+            print("Calendar features will not be available")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global mongo_client
+    if mongo_client:
+        mongo_client.close()
+        print("MongoDB connection closed")
 
 origins = [
     "http://localhost:3000",
@@ -86,6 +161,216 @@ def get_calendars():
 def add_calendar(calendar: Calendar):
     memory_db["calendars"].append(calendar)
     return calendar
+
+# Calendar API Endpoints
+@app.get("/api/calendar/events")
+async def get_events(
+    user_id: str = Query(..., description="User ID"),
+    start: Optional[str] = Query(None, description="Start date (ISO format)"),
+    end: Optional[str] = Query(None, description="End date (ISO format)")
+):
+    """Get events for a user, optionally filtered by date range."""
+    if not calendar_manager:
+        raise HTTPException(status_code=503, detail="Calendar service unavailable")
+    
+    try:
+        start_dt = None
+        if start:
+            start_clean = start.replace('Z', '+00:00') if 'Z' in start else start
+            start_dt = datetime.fromisoformat(start_clean)
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=timezone.utc)
+        end_dt = None
+        if end:
+            end_clean = end.replace('Z', '+00:00') if 'Z' in end else end
+            end_dt = datetime.fromisoformat(end_clean)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+        
+        events = calendar_manager.get_user_events(user_id, start_dt, end_dt)
+        
+        # Transform MongoDB documents to match API response format
+        formatted_events = []
+        for event in events:
+            formatted_event = {
+                'id': event.get('_id', ''),
+                'user_id': event.get('user_id', ''),
+                'title': event.get('title', ''),
+                'start_time': event['start_time'].isoformat() if isinstance(event.get('start_time'), datetime) else str(event.get('start_time', '')),
+                'end_time': event['end_time'].isoformat() if isinstance(event.get('end_time'), datetime) else str(event.get('end_time', '')),
+                'event_type': event.get('event_type', ''),
+                'location': event.get('location'),
+                'description': event.get('description'),
+                'color': event.get('color', '#3498db'),
+                'recurrence': event.get('recurrence', 'none'),
+                'recurrence_end_date': event['recurrence_end_date'].isoformat() if event.get('recurrence_end_date') and isinstance(event['recurrence_end_date'], datetime) else (event.get('recurrence_end_date') if event.get('recurrence_end_date') else None),
+                'reminders': event.get('reminders', [15, 60])
+            }
+            formatted_events.append(formatted_event)
+        
+        return formatted_events
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error fetching events: {str(e)}")
+
+@app.post("/api/calendar/events")
+async def create_event(event_data: EventCreate):
+    """Create a new calendar event."""
+    if not calendar_manager:
+        raise HTTPException(status_code=503, detail="Calendar service unavailable")
+    
+    try:
+        event_dict = event_data.dict()
+        result = calendar_manager.create_event(event_data.user_id, event_dict)
+        
+        if result['success']:
+            # Fetch and return the created event
+            event = calendar_manager.get_event(result['event_id'], event_data.user_id)
+            if event:
+                # Format the event the same way as get_events
+                formatted_event = {
+                    'id': event.get('_id', ''),
+                    'user_id': event.get('user_id', ''),
+                    'title': event.get('title', ''),
+                    'start_time': event['start_time'].isoformat() if isinstance(event.get('start_time'), datetime) else str(event.get('start_time', '')),
+                    'end_time': event['end_time'].isoformat() if isinstance(event.get('end_time'), datetime) else str(event.get('end_time', '')),
+                    'event_type': event.get('event_type', ''),
+                    'location': event.get('location'),
+                    'description': event.get('description'),
+                    'color': event.get('color', '#3498db'),
+                    'recurrence': event.get('recurrence', 'none'),
+                    'recurrence_end_date': event['recurrence_end_date'].isoformat() if event.get('recurrence_end_date') and isinstance(event['recurrence_end_date'], datetime) else (event.get('recurrence_end_date') if event.get('recurrence_end_date') else None),
+                    'reminders': event.get('reminders', [15, 60])
+                }
+                return formatted_event
+            return {"success": True, "event_id": result['event_id']}
+        else:
+            raise HTTPException(status_code=400, detail=result.get('error', 'Failed to create event'))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating event: {str(e)}")
+
+@app.put("/api/calendar/events/{event_id}")
+async def update_event(event_id: str, event_data: EventUpdate, user_id: str = Query(..., description="User ID")):
+    """Update an existing calendar event."""
+    if not calendar_manager:
+        raise HTTPException(status_code=503, detail="Calendar service unavailable")
+    
+    try:
+        # Only include fields that are provided (not None)
+        update_dict = {k: v for k, v in event_data.dict().items() if v is not None}
+        
+        if not update_dict:
+            raise HTTPException(status_code=400, detail="No fields to update")
+        
+        result = calendar_manager.update_event(event_id, user_id, update_dict)
+        
+        if result['success']:
+            return {"success": True}
+        else:
+            raise HTTPException(status_code=400, detail=result.get('error', 'Failed to update event'))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating event: {str(e)}")
+
+@app.delete("/api/calendar/events/{event_id}")
+async def delete_event(
+    event_id: str,
+    user_id: str = Query(..., description="User ID"),
+    delete_future: bool = Query(False, description="If true, delete this event and future occurrences (for recurring events)"),
+    from_date: Optional[str] = Query(None, description="ISO datetime to begin deleting future occurrences from; defaults to now")
+):
+    """Delete a calendar event."""
+    if not calendar_manager:
+        raise HTTPException(status_code=503, detail="Calendar service unavailable")
+    
+    try:
+        # Support deleting only future occurrences for recurring events
+        parsed_from = None
+        if delete_future:
+            if from_date:
+                # normalize ISO string
+                from_clean = from_date.replace('Z', '+00:00') if 'Z' in from_date else from_date
+                parsed_from = datetime.fromisoformat(from_clean)
+                if parsed_from.tzinfo is None:
+                    parsed_from = parsed_from.replace(tzinfo=timezone.utc)
+            else:
+                parsed_from = datetime.now(timezone.utc)
+
+        result = calendar_manager.delete_event(event_id, user_id, delete_future=delete_future, from_date=parsed_from)
+        
+        if result['success']:
+            return {"success": True}
+        else:
+            raise HTTPException(status_code=404, detail="Event not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting event: {str(e)}")
+
+@app.get("/api/calendar/free-slots")
+async def get_free_slots(
+    user_id: str = Query(..., description="User ID"),
+    start: str = Query(..., description="Start date (ISO format)"),
+    end: str = Query(..., description="End date (ISO format)"),
+    min_duration: int = Query(30, description="Minimum duration in minutes")
+):
+    """Find free time slots for a user in a date range."""
+    if not calendar_manager:
+        raise HTTPException(status_code=503, detail="Calendar service unavailable")
+    
+    try:
+        start_clean = start.replace('Z', '+00:00') if 'Z' in start else start
+        end_clean = end.replace('Z', '+00:00') if 'Z' in end else end
+        start_dt = datetime.fromisoformat(start_clean)
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=timezone.utc)
+        end_dt = datetime.fromisoformat(end_clean)
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+        
+        result = calendar_manager.find_free_slots(user_id, start_dt, end_dt, min_duration)
+        
+        if result['success']:
+            return result
+        else:
+            raise HTTPException(status_code=400, detail=result.get('error', 'Failed to find free slots'))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error finding free slots: {str(e)}")
+
+@app.get("/api/calendar/statistics")
+async def get_statistics(
+    user_id: str = Query(..., description="User ID"),
+    start: str = Query(..., description="Start date (ISO format)"),
+    end: str = Query(..., description="End date (ISO format)")
+):
+    """Get event statistics for a user in a date range."""
+    if not calendar_manager:
+        raise HTTPException(status_code=503, detail="Calendar service unavailable")
+    
+    try:
+        start_clean = start.replace('Z', '+00:00') if 'Z' in start else start
+        end_clean = end.replace('Z', '+00:00') if 'Z' in end else end
+        start_dt = datetime.fromisoformat(start_clean)
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=timezone.utc)
+        end_dt = datetime.fromisoformat(end_clean)
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+        
+        result = calendar_manager.get_statistics(user_id, start_dt, end_dt)
+        
+        if result['success']:
+            return result
+        else:
+            raise HTTPException(status_code=400, detail=result.get('error', 'Failed to get statistics'))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting statistics: {str(e)}")
 
 if __name__ == "__main__":
     uvicorn.run(app, host = "0.0.0.0", port = 8000)

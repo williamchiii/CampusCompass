@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import "./css/app.css";
+import Calendar from "./Calendar";
+import Taskbar from "./Taskbar";
 
 interface UserData {
   user_name: string;
@@ -32,42 +34,38 @@ export default function Dashboard() {
   }
 
   return (
-    <div style={{ padding: "2rem", maxWidth: "800px", margin: "0 auto" }}>
-      <div style={{ 
-        background: "white", 
-        padding: "2rem", 
-        borderRadius: "8px", 
-        boxShadow: "0 2px 4px rgba(0,0,0,0.1)" 
-      }}>
-        <h1 style={{ marginBottom: "1rem", color: "#003087" }}>
-          Hello, {user.user_name}!
-        </h1>
-        <p style={{ fontSize: "1.1rem", color: "#666", marginBottom: "2rem" }}>
-          Email: {user.user_email}
-        </p>
-        
-        <button 
-          onClick={handleLogout}
-          style={{
-            padding: "0.75rem 1.5rem",
-            background: "#FA4616",
-            color: "white",
-            border: "none",
-            borderRadius: "4px",
-            cursor: "pointer",
-            fontSize: "1rem"
-          }}
-        >
-          Logout
-        </button>
-      </div>
+    <div className="h-screen flex flex-col bg-gray-50">
+      {/* Header with user info and logout */}
+      <header className="bg-white border-b border-gray-200 shadow-sm">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
+          <div className="flex justify-between items-center">
+            <div>
+              <h1 className="text-2xl font-bold text-[#003087]">
+                Campus Compass
+              </h1>
+              <p className="text-sm text-gray-600 mt-1">
+                Welcome, {user.user_name} • {user.user_email}
+              </p>
+            </div>
+            <button
+              onClick={handleLogout}
+              className="px-4 py-2 bg-[#FA4616] text-white rounded-md hover:bg-[#d93a0f] transition-colors"
+            >
+              Logout
+            </button>
+          </div>
+        </div>
+      </header>
 
-      <div style={{ marginTop: "2rem", padding: "1.5rem", background: "white", borderRadius: "8px" }}>
-        <h2 style={{ color: "#003087", marginBottom: "1rem" }}>Welcome to Campus Compass!</h2>
-        <p style={{ color: "#666" }}>
-          Your campus navigation companion for the University of Florida.
-        </p>
-      </div>
+      {/* Main content - Calendar and Taskbar */}
+      <main className="flex-1 overflow-hidden flex">
+        <div className="flex-1 overflow-hidden">
+          <Calendar userId={user.user_id} />
+        </div>
+        <div className="w-80 overflow-hidden border-l border-gray-200">
+          <Taskbar userId={user.user_id} />
+        </div>
+      </main>
     </div>
   );
 }
